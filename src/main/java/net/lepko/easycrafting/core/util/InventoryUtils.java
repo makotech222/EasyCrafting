@@ -260,8 +260,6 @@ public class InventoryUtils {
 				ItemStack is = stack.splitStack(amount);
 				if (stack.stackSize == 0) {
 					inv.setInventorySlotContents(slotIndex, null);
-				} else {
-					inv.markDirty();
 				}
 				inv.markDirty();
 				return is;

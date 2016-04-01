@@ -12,6 +12,7 @@ import net.minecraft.inventory.Container;
 import net.minecraft.inventory.IInventory;
 import net.minecraft.inventory.ISidedInventory;
 import net.minecraft.inventory.InventoryCrafting;
+import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.crafting.CraftingManager;
 import net.minecraft.item.crafting.IRecipe;
@@ -22,8 +23,7 @@ import net.minecraftforge.common.util.Constants;
 import net.minecraftforge.common.util.FakePlayer;
 import net.minecraftforge.common.util.FakePlayerFactory;
 
-import java.util.List;
-import java.util.Locale;
+import java.util.*;
 
 public class TileEntityAutoCrafting extends TileEntity implements ISidedInventory, IGuiTile {
 
@@ -75,6 +75,9 @@ public class TileEntityAutoCrafting extends TileEntity implements ISidedInventor
     private int lastUpdate = 0;
 
     private ItemStack[] inventory = new ItemStack[26];
+    private boolean inputRestricted = false;
+    List<Integer> inputsNeeded = new ArrayList<Integer>(9);
+
     public final int[] SLOTS = InventoryUtils.createSlotArray(10, inventory.length);
 
     private boolean poweredNow = false;
@@ -138,9 +141,16 @@ public class TileEntityAutoCrafting extends TileEntity implements ISidedInventor
         return result;
     }
 
-    private boolean tryCrafting() {
+    /**
+     * Combines the test for whether we can craft (pulled out of tryCrafting) with code to prepare the data for input
+     * restriction checking, ie, do we need to restrict any inputs to ensure we maintain room for all ingredients?
+     *
+     * @return refs if we will be ready to craft something *now*, otherwise null
+     */
+    private StackReference[] verifyCraftability() {
         if (currentRecipe == null || getStackInSlot(9) == null) {
-            return false;
+            inputRestricted = false; // no input restrictions if there's no recipe to defend!
+            return null;
         }
 
         boolean[] found = new boolean[9];
@@ -168,11 +178,53 @@ public class TileEntityAutoCrafting extends TileEntity implements ISidedInventor
             }
         }
 
-        for (boolean b : found) {
-            if (!b) {
-                return false;
+        inputsNeeded.clear();
+        List<ItemStack> inputsCounted = new ArrayList<ItemStack>(9);
+        boolean canCraft = true;
+
+        for (int gridSlot = 0; gridSlot < 9; gridSlot++) {
+            ItemStack test = ItemStack.copyItemStack(getStackInSlot(gridSlot));
+            if (test != null) {
+                test.stackSize = 1;
+
+                canCraft = canCraft && found[gridSlot];
+
+                alreadyReserved: { // make sure it's a *unique* ingredient
+                    for (ItemStack x : inputsCounted) {
+                        if (ItemStack.areItemStacksEqual(x, test))
+                            break alreadyReserved;
+                    }
+
+                    if (! found[gridSlot]) {
+                        inputsNeeded.add(gridSlot);
+                    }
+
+                    inputsCounted.add(test);
+                }
             }
         }
+
+        if (canCraft) {
+            inputRestricted = false; // no restrictions if we already have all needed inputs
+            return refs;
+        } else {
+            // we can't craft, so we'll go ahead and check what's needed and how many empty slots we have for inputs
+            int inputSlotsEmpty = 0;
+
+            for (int invSlot = 10; invSlot < 18; invSlot++) {
+                ItemStack stack = ItemStack.copyItemStack(getStackInSlot(invSlot));
+                if (stack == null || stack.stackSize <= 0)
+                    inputSlotsEmpty ++;
+            }
+
+            inputRestricted = (inputSlotsEmpty <= inputsNeeded.size());
+            return null;
+        }
+    }
+
+    private boolean tryCrafting() {
+        StackReference[] refs = verifyCraftability();
+        if (refs == null) return false;
 
         // replace all ingredients with found stacks
         for (int i = 0; i < 9; i++) {
@@ -192,18 +244,32 @@ public class TileEntityAutoCrafting extends TileEntity implements ISidedInventor
                 FMLCommonHandler.instance().firePlayerCraftingEvent(fakePlayer, result, craftingGrid);
                 result.onCrafting(worldObj, fakePlayer, result.stackSize);
 
-                for (StackReference ref : refs) {
-                    if (ref != null) {
-                        ItemStack stack = ref.decreaseStackSize(1);
-                        if (stack != null && stack.getItem() != null && stack.getItem().hasContainerItem(stack)) {
-                            ItemStack container = stack.getItem().getContainerItem(stack);
-                            if (container.isItemStackDamageable() && container.getItemDamage() > container.getMaxDamage()) {
+                for (int i=0; i<9; i++) {
+                    StackReference ref = refs[i];                             if (ref       == null) continue;
+                    ItemStack stack = ref.decreaseStackSize(1);               if (stack     == null) continue;
+                    Item stackItem = stack.getItem();                         if (stackItem == null) continue;
+                    ItemStack container = stackItem.getContainerItem(stack);  if (container == null) continue;
+                    if (container.isItemStackDamageable() && container.getItemDamage() > container.getMaxDamage())
+                        continue;
+
+                    // attempt to let the ingredient remain in its slot?
+                    if (! stackItem.doesContainerItemLeaveCraftingGrid(stack)) {
+                        ItemStack actualStack = getStackInSlot(ref.slot);
+
+                        if (actualStack == null || actualStack.stackSize == 0) { // slot is now empty, so just put container stack there
+                            setInventorySlotContents(ref.slot, container);
+                            container = null;
+                        } else {
+                            // if we can't put it back in the same slot, try to shove it somewhere in inputs
+                            if (container != null && InventoryUtils.addItemToInventory(this, container.copy(), 10, 18))
                                 container = null;
-                            }
-                            if (container != null && !InventoryUtils.addItemToInventory(this, container, 18, 26)) {
-                                InventoryUtils.dropItem(worldObj, xCoord + 0.5, yCoord + 1, zCoord + 0.5, container);
-                                // XXX: try other inventories
-                            }
+                        }
+                    }
+
+                    if (container != null) {
+                        if (!InventoryUtils.addItemToInventory(this, container.copy(), 18, 26)) {
+                            InventoryUtils.dropItem(worldObj, xCoord + 0.5, yCoord + 1, zCoord + 0.5, container);
+                            // XXX: try other inventories?
                         }
                     }
                 }
@@ -214,6 +280,7 @@ public class TileEntityAutoCrafting extends TileEntity implements ISidedInventor
 
         // restore original items from ghost slots
         InventoryUtils.setContents(craftingGrid, this);
+        verifyCraftability(); // crafting will have changed contents, so re-run verify to ensure correct input blocking
         return craftingCompleted;
     }
 
@@ -257,6 +324,7 @@ public class TileEntityAutoCrafting extends TileEntity implements ISidedInventor
             lastUpdate = 0;
 
             if (lastCraftingSuccess || inventoryChanged) {
+                if (inventoryChanged) verifyCraftability();
                 inventoryChanged = false;
 
                 if (mode == Mode.ALWAYS || (mode == Mode.POWERED && poweredNow) || (mode == Mode.UNPOWERED && !poweredNow)) {
@@ -346,7 +414,17 @@ public class TileEntityAutoCrafting extends TileEntity implements ISidedInventor
 
     @Override
     public boolean canInsertItem(int slotIndex, ItemStack stack, int side) {
-        return slotIndex >= 10 && slotIndex < 18;
+        if (inventoryChanged) verifyCraftability();
+
+        if (slotIndex < 10 || slotIndex >= 18) return false;  // not valid insert slot
+        if (! inputRestricted)                 return true;   // plenty of space
+        if (getStackInSlot(slotIndex) != null) return true;   // slot not empty, allow normal item stacking behavior
+
+        for (int testSlot : inputsNeeded)
+            if (isReplaceableInCraftingGridSlot(testSlot, stack))
+                return true;
+
+        return false;
     }
 
     @Override
